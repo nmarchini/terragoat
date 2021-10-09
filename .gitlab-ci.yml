@@ -1,0 +1,267 @@
+---
+variables:
+  TF_VERSION: '0.14.6'
+
+cache:
+  paths:
+    - .terraform/plugins
+
+stages:
+  - validate
+  - test
+  - staging plan
+  - staging deploy
+  - staging stop
+
+tf-format:
+  stage: validate
+  tags:
+    - docker
+  allow_failure: false
+  image:
+    name: hashicorp/terraform:$TF_VERSION
+    entrypoint:
+      - '/usr/bin/env'
+      - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+  rules:
+    - if: $CI_COMMIT_BRANCH
+      exists:
+        - '**/*.tf'
+  script:
+    - rm -rf .terraform terraform.tfstate terraform.tfstate.backup
+    - echo "Terraform Format"
+    - terraform --version
+    - terraform fmt -check -recursive .
+
+tf-validate:
+  stage: validate
+  tags:
+    - docker
+  allow_failure: false
+  image:
+    name: hashicorp/terraform:$TF_VERSION
+    entrypoint:
+      - '/usr/bin/env'
+      - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+  rules:
+    - if: $CI_COMMIT_BRANCH
+      exists:
+        - '**/*.tf'
+  script:
+    - rm -rf .terraform terraform.tfstate terraform.tfstate.backup
+    - echo "Validate Terraform"
+    - terraform --version
+    - terraform init -backend=false
+    - terraform validate
+
+yaml-lint:
+  stage: validate
+  tags:
+    - docker
+  allow_failure: false
+  image:
+    name: registry.gitlab.com/pipeline-components/yamllint:latest
+  script:
+    - yamllint .
+
+#docker-lint:
+#  stage: validate
+#  tags:
+#    - docker
+#  allow_failure: false
+#  image:
+#    name: replicated/dockerfilelint:latest
+#  script:
+#    - dockerfilelint Dockerfile
+
+tf-lint:
+  stage: validate
+  tags:
+    - docker
+  allow_failure: false
+  image:
+    name: ghcr.io/terraform-linters/tflint-bundle:latest
+    entrypoint:
+      - '/usr/bin/env'
+      - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+  rules:
+    - if: $CI_COMMIT_BRANCH
+      exists:
+        - '**/*.tf'
+  script:
+    - tflint --enable-plugin=aws
+    - tflint --version
+    - tflint .
+
+
+checkov-TF:
+  stage: test
+  tags:
+    - docker
+  allow_failure: false  # True for AutoDevOps compatibility
+  image:
+    name: bridgecrew/checkov:latest
+    entrypoint:
+      - '/usr/bin/env'
+      - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+  rules:
+    - if: $SAST_DISABLED
+      when: never
+    - if: $CI_COMMIT_BRANCH
+      exists:
+        - '**/*.json'
+        - '**/*.template'
+        - '**/*.tf'
+        - '**/serverless.yml'
+        - '**/serverless.yaml'
+  script:
+    - checkov --framework=terraform --quiet -d . -o junitxml | tee checkov-terraform.test.xml
+  artifacts:
+    reports:
+      junit: "checkov-terraform.test.xml"
+    paths:
+      - "checkov-terraform.test.xml"
+
+checkov-K8S:
+  stage: test
+  tags:
+    - docker
+  allow_failure: false  # True for AutoDevOps compatibility
+  image:
+    name: bridgecrew/checkov:latest
+    entrypoint:
+      - '/usr/bin/env'
+      - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+  rules:
+    - if: $SAST_DISABLED
+      when: never
+    - if: $CI_COMMIT_BRANCH
+      exists:
+        - '**/*.yml'
+        - '**/*.yaml'
+  script:
+    - checkov --framework=kubernetes --quiet -d . -o junitxml | tee checkov-kubernetes.test.xml
+  artifacts:
+    reports:
+      junit: "checkov-kubernetes.test.xml"
+    paths:
+      - "checkov-kubernetes.test.xml"
+
+
+checkov-Dockerfile:
+  stage: test
+  tags:
+    - docker
+  allow_failure: false  # True for AutoDevOps compatibility
+  image:
+    name: bridgecrew/checkov:latest
+    entrypoint:
+      - '/usr/bin/env'
+      - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+  rules:
+    - if: $SAST_DISABLED
+      when: never
+    - if: $CI_COMMIT_BRANCH
+      exists:
+        - 'Dockerfile'
+  script:
+    - checkov --framework=dockerfile --quiet -d . --skip-check CKV_DOCKER_2 -o junitxml | tee checkov.test.xml
+  artifacts:
+    reports:
+      junit: "checkov.test.xml"
+    paths:
+      - "checkov.test.xml"
+
+tfsec:
+  stage: test
+  allow_failure: false
+  image:
+    name: tfsec/tfsec:latest
+    entrypoint:
+      - '/usr/bin/env'
+      - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+  rules:
+    - if: $CI_COMMIT_BRANCH
+      exists:
+        - '**/*.tf'
+  script:
+    - echo "Running TFSEC"
+    - tfsec . --format junit --out tfsec.test.xml --include-passed
+  artifacts:
+    reports:
+      junit: "tfsec.test.xml"
+    paths:
+      - "tfsec.test.xml"
+
+deploy_plan:
+  stage: staging plan
+  tags:
+    - docker
+  variables:
+    TF_VAR_DEPLOY_INTO_ACCOUNT_ID: ${STAGING_ACCOUNT_ID}
+    TF_VAR_ASSUME_ROLE_EXTERNAL_ID: ${STAGING_ASSUME_ROLE_EXTERNAL_ID}
+    TF_VAR_AWS_REGION: ${STAGING_AWS_REGION}
+  script:
+    - rm -rf .terraform terraform.tfstate terraform.tfstate.backup
+    - terraform --version
+    - terraform init -backend-config="bucket=${STAGING_TERRAFORM_S3_BUCKET}"
+      -backend-config="region=${TF_VAR_AWS_REGION}"
+      -backend-config="role_arn=arn:aws:iam::${TF_VAR_DEPLOY_INTO_ACCOUNT_ID}:role/S3BackendRole"
+      -backend-config="external_id=${TF_VAR_ASSUME_ROLE_EXTERNAL_ID}"
+      -backend-config="session_name=TerraformBackend"
+    - terraform plan -refresh=true -compact-warnings
+  environment:
+    name: staging
+    url: https://staging.example.com
+    on_stop: stop_staging
+  only:
+    variables:
+      - $DEPLOY_TO == "staging"
+
+deploy_apply:
+  stage: staging deploy
+  tags:
+    - docker
+  variables:
+    TF_VAR_DEPLOY_INTO_ACCOUNT_ID: ${STAGING_ACCOUNT_ID}
+    TF_VAR_ASSUME_ROLE_EXTERNAL_ID: ${STAGING_ASSUME_ROLE_EXTERNAL_ID}
+    TF_VAR_AWS_REGION: ${STAGING_AWS_REGION}
+  script:
+    - rm -rf .terraform terraform.tfstate terraform.tfstate.backup
+    - terraform --version
+    - terraform init -backend-config="bucket=${STAGING_TERRAFORM_S3_BUCKET}"
+      -backend-config="region=${TF_VAR_AWS_REGION}"
+      -backend-config="role_arn=arn:aws:iam::${TF_VAR_DEPLOY_INTO_ACCOUNT_ID}:role/S3BackendRole"
+      -backend-config="external_id=${TF_VAR_ASSUME_ROLE_EXTERNAL_ID}"
+      -backend-config="session_name=TerraformBackend"
+    - terraform apply --auto-approve -input=true
+  environment:
+    name: staging
+    on_stop: stop_staging
+  only:
+    variables:
+      - $DEPLOY_TO == "staging"
+
+stop_staging:
+  stage: staging stop
+  tags:
+    - docker
+  variables:
+    TF_VAR_DEPLOY_INTO_ACCOUNT_ID: ${STAGING_ACCOUNT_ID}
+    TF_VAR_ASSUME_ROLE_EXTERNAL_ID: ${STAGING_ASSUME_ROLE_EXTERNAL_ID}
+    TF_VAR_AWS_REGION: ${STAGING_AWS_REGION}
+  script:
+    - rm -rf .terraform terraform.tfstate terraform.tfstate.backup
+    - terraform init -backend-config="bucket=${STAGING_TERRAFORM_S3_BUCKET}"
+      -backend-config="region=${TF_VAR_AWS_REGION}"
+      -backend-config="role_arn=arn:aws:iam::${TF_VAR_DEPLOY_INTO_ACCOUNT_ID}:role/S3BackendRole"
+      -backend-config="external_id=${TF_VAR_ASSUME_ROLE_EXTERNAL_ID}"
+      -backend-config="session_name=TerraformBackend"
+    - terraform destroy -input=false -auto-approve
+  when: manual
+  environment:
+    name: staging
+    action: stop
+  only:
+    variables:
+      - $DEPLOY_TO == "staging"
